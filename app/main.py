@@ -1,4 +1,5 @@
-import os
+import base64
+import binascii
 import secrets
 from datetime import datetime, timezone
 from enum import Enum
@@ -11,8 +12,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title="SecDev Course App", version="0.1.0")
+from app.config import get_settings
+from app.files import AttachmentError, save_attachment
+from app.notifications import NotificationClient, NotificationError, build_notification_client
 
+app = FastAPI(title="SecDev Course App", version="0.1.0")
 
 class ApiError(Exception):
     def __init__(
@@ -142,10 +146,12 @@ def _initial_state() -> Dict[str, Any]:
         "users": {},
         "chores": {},
         "assignments": {},
+        "attachments": {},
         "sequence": {
             "user": 1,
             "chore": 1,
             "assignment": 1,
+            "attachment": 1,
         },
     }
 
@@ -176,15 +182,16 @@ API_KEY_ENV_VAR = "APP_API_KEY"
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
-    expected = os.environ.get(API_KEY_ENV_VAR)
-    if not expected:
+    try:
+        expected = get_settings().app_api_key
+    except Exception as exc:  # noqa: BLE001
         raise ApiError(
             status=500,
             title="Internal Server Error",
             detail="API key not configured",
             type_="https://example.com/problems/configuration-error",
             code="config_error",
-        )
+        ) from exc
     if not x_api_key or not secrets.compare_digest(x_api_key, expected):
         raise ApiError(
             status=401,
@@ -359,6 +366,25 @@ class AssignmentRead(AssignmentBase):
     status: AssignmentStatus
 
 
+class AttachmentUpload(BaseModel):
+    content: bytes = Field(
+        ...,
+        description="Base64 encoded PNG/JPEG payload",
+    )
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def decode_base64(cls, value: Any) -> bytes:
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            try:
+                return base64.b64decode(value, validate=True)
+            except binascii.Error as exc:
+                raise ValueError("content must be base64-encoded data") from exc
+        raise ValueError("content must be provided as base64 string")
+
+
 class AssignmentStats(BaseModel):
     total: int
     by_status: Dict[str, int]
@@ -477,7 +503,47 @@ def delete_chore(chore_id: int, _: None = Depends(require_api_key)):
     for assignment_id, assignment in list(_DB["assignments"].items()):
         if assignment["chore_id"] == chore_id:
             _DB["assignments"].pop(assignment_id, None)
+    attachments = _DB["attachments"].pop(chore_id, [])
+    settings = get_settings()
+    for attachment in attachments:
+        try:
+            (settings.attachments_dir / attachment["filename"]).unlink(missing_ok=True)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # Best-effort cleanup; surfacing errors would leak storage layout.
+            continue
     return None
+
+
+@app.post("/chores/{chore_id}/attachments", status_code=201)
+def upload_chore_attachment(
+    chore_id: int,
+    payload: AttachmentUpload,
+    _: None = Depends(require_api_key),
+):
+    _get_chore_or_404(chore_id)
+    data = payload.content
+    settings = get_settings()
+    try:
+        meta = save_attachment(settings.attachments_dir, data)
+    except AttachmentError as exc:
+        raise ApiError(
+            status=exc.status,
+            title="Bad Request",
+            detail=exc.detail,
+            type_="https://example.com/problems/attachment-error",
+            code=exc.code,
+        ) from exc
+    attachment = {
+        "id": _next_sequence("attachment"),
+        "chore_id": chore_id,
+        "filename": meta.filename,
+        "content_type": meta.content_type,
+        "size": meta.size,
+    }
+    _DB["attachments"].setdefault(chore_id, []).append(attachment)
+    return attachment
 
 
 @app.post("/assignments", status_code=201, response_model=AssignmentRead)
@@ -524,6 +590,39 @@ def update_assignment(
         assignment["due_at"] = update_data["due_at"]
     _DB["assignments"][assignment_id] = assignment
     return assignment
+
+
+@app.post("/assignments/{assignment_id}/notify")
+def notify_assignment(
+    assignment_id: int,
+    client: NotificationClient = Depends(build_notification_client),
+    _: None = Depends(require_api_key),
+):
+    assignment = _get_assignment_or_404(assignment_id)
+    chore = _get_chore_or_404(assignment["chore_id"])
+    user = _get_user_or_404(assignment["user_id"])
+    payload = {
+        "assignment_id": assignment_id,
+        "chore_title": chore["title"],
+        "user_id": user["id"],
+        "due_at": assignment["due_at"].astimezone(timezone.utc).isoformat()
+        if isinstance(assignment["due_at"], datetime)
+        else assignment["due_at"],
+        "status": assignment["status"].value
+        if isinstance(assignment["status"], AssignmentStatus)
+        else assignment["status"],
+    }
+    try:
+        client.send(payload)
+    except NotificationError as exc:
+        raise ApiError(
+            status=exc.status,
+            title="Notification Failed",
+            detail=exc.detail,
+            type_="https://example.com/problems/notification-error",
+            code=exc.code,
+        ) from exc
+    return {"status": "queued"}
 
 
 @app.get("/stats", response_model=StatsResponse)
